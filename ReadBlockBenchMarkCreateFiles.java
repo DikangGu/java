@@ -36,8 +36,8 @@ public class ReadBlockBenchMarkCreateFiles extends Configured implements Tool {
   private static Path DATA_DIR = new Path(TEST_ROOT_DIR, "io_data");
   private static final String BASE_FILE_NAME = "test_read_block_";
   
-  int numFiles = 10;
-  static long[] blockSizes = new long[] {32 * 1024};
+  public static int numFiles = 10;
+  public static final long[] blockSizes = new long[] {32*1024, 4*1024*1024, 64*1024*1024,256*1024*1024};
   
   @Override
   public int run(String[] args) throws Exception {

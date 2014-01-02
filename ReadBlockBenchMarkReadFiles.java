@@ -36,9 +36,16 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
   private static Path DATA_DIR = new Path(TEST_ROOT_DIR, "io_data");
   private static final String BASE_FILE_NAME = "test_read_block_";
   
-  int numFiles = 10;
-  static long[] blockSizes = new long[] {32 * 1024};
+  int numFiles = ReadBlockBenchMarkCreateFiles.numFiles;
+  static long[] blockSizes = ReadBlockBenchMarkCreateFiles.blockSizes;
 
+  private void backupOutputDir(FileSystem fs) throws IOException {
+    if (fs.exists(OUTPUT_DIR)) {
+      Path newPath = new Path(TEST_ROOT_DIR, "io_output_" + System.currentTimeMillis());
+      fs.rename(OUTPUT_DIR, newPath);
+    }
+  }
+  
   @Override
   public int run(String[] args) throws Exception {
     Configuration conf = new Configuration(getConf());
@@ -46,7 +53,7 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
     
     //createControlFile(fs, numFiles, conf);
     
-    fs.delete(OUTPUT_DIR, true);
+    backupOutputDir(fs);
     runBenchmark(OUTPUT_DIR, conf);
     return 0;
   }

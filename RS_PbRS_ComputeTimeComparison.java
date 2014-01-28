@@ -1,3 +1,5 @@
+//Has the compute time for decoding 10th data block as well
+
 package org.apache.hadoop.raid.tools;
 
 import java.io.IOException;
@@ -34,7 +36,7 @@ public class RS_PbRS_ComputeTimeComparison {
   private static Path OUTPUT_DIR = new Path(TEST_ROOT_DIR, "io_output");
   private static final String BASE_FILE_NAME = "test_compute_time_";
   
-  public static int numFiles = 100;
+  public static int numFiles = 200;
   
     {
        Configuration.addDefaultResource("hdfs-default.xml");
@@ -131,6 +133,7 @@ public class RS_PbRS_ComputeTimeComparison {
     private byte[][] writeBufsForEncRS;
     private byte[][][] readBufsForEncPB;
     private byte[][][] writeBufsForEncPB;
+    private byte [][] writeBuffsForEncLrc;
     private PiggyBackCode pbcode;
     private PiggyBackDecoder pbdecoder; //just to use the method getLocConsideredErased
     private ReedSolomonCode rscode;
@@ -142,22 +145,52 @@ public class RS_PbRS_ComputeTimeComparison {
       String name1 = key.toString(); 
       String timeResult = "";
       
-      //first perform RS encoding and measure time
+      //RS encoding and measure time
       readBufsForEncRS =  returnRandomDataForEncodeRS();
+      writeBufsForEncRS = new byte[paritySize][bufSize];
       long startTime = System.currentTimeMillis();
       rscode.encodeBulk(readBufsForEncRS, writeBufsForEncRS);
       long timeComputeEncodeRS = System.currentTimeMillis() - startTime;
+  
+      //lrc encoding
+      readBuffsRS = returnRandomDataForEncodeLRC(); //reusing readBuff from RS      
+      writeBuffsForEncLrc = new byte[paritySize+2][bufSize]; //two additional for local parities
+      startTime = System.currentTimeMillis();      
+      pbcode.encodeBulkLRCForCompare(readBuffsRS, writeBuffsForEncLrc, true);
+      long timeComputeEncodelrc = System.currentTimeMillis() - startTime;
       
-      //then perform PB-RS encoding and measure time
+      //PB-RS encoding and measure time: non-xor, with sub, older impl
       readBufsForEncPB = returnRandomDataForEncodePB();
+      writeBufsForEncPB = new byte[2][paritySize][bufSizePerSubpkt];
       startTime = System.currentTimeMillis();
       pbcode.jointEncodeSubPackets(readBufsForEncPB, readBufsForEncPB, bufSizePerSubpkt);
       long timeComputeEncodePB1 = System.currentTimeMillis() - startTime;
       
-      startTime = System.currentTimeMillis();
+    //PB-RS encoding and measure time: non-xor, with sub, new impl
+      readBufsForEncPB = returnRandomDataForEncodePB();
+      writeBufsForEncPB = new byte[2][paritySize][bufSizePerSubpkt];
       xorVersion = false;
+      startTime = System.currentTimeMillis();
       pbcode.jointEncodeSubPacketsNew(readBufsForEncPB, writeBufsForEncPB, bufSizePerSubpkt, xorVersion);
       long timeComputeEncodePB2 = System.currentTimeMillis() - startTime;
+      
+    //PB-RS encoding and measure time: second implementation: xor encoding with subtraction      
+      readBufsForEncPB = returnRandomDataForEncodePB();
+      writeBufsForEncPB = new byte[2][paritySize][bufSizePerSubpkt];
+      xorVersion = true;
+      startTime = System.currentTimeMillis();
+      pbcode.jointEncodeSubPacketsNew(readBufsForEncPB, writeBufsForEncPB, bufSizePerSubpkt, xorVersion);
+      long timeComputeEncodePB3 = System.currentTimeMillis() - startTime;
+      
+    //PB-RS encoding and measure time: second implementation: xor encoding without subtraction      
+      readBufsForEncPB = returnRandomDataForEncodePB();
+      writeBufsForEncPB = new byte[2][paritySize][bufSizePerSubpkt];
+      xorVersion = true;
+      startTime = System.currentTimeMillis();
+      pbcode.jointEncodeSubPacketsNewWithoutSub(readBufsForEncPB, writeBufsForEncPB, bufSizePerSubpkt, xorVersion);
+      long timeComputeEncodePB4 = System.currentTimeMillis() - startTime;
+      
+ //Now Decoding Time Measurements         
       
       //first perform RS decoding and measure time      
       readBuffsRS = returnRandomDataForDecodeRS();
@@ -165,11 +198,12 @@ public class RS_PbRS_ComputeTimeComparison {
       rscode.decodeBulk(readBuffsRS, writeBuffsRS, erasedLocs, dataStart, dataLenForRS);
       long timeComputeDecodeRS = System.currentTimeMillis() - startTime;
       
-      //second perform PB-RS decoding and measure time      
-      readBuffsPB = returnRandomDataForDecodePB();
+      //second perform PB-RS decoding and measure time    
       
       //first type of PB-RS decoding: first do RS decoding on second subpkt, get the piggyback,
-      //and then do RS decoding again to obtain missing data in first subpkt.
+      //and then do RS decoding again to obtain missing data in first subpkt. 
+      readBuffsPB = returnRandomDataForDecodePB();      
+      writeBuffsRS = new byte[paritySize][bufSize];      
       startTime = System.currentTimeMillis();
       pbcode.jointDecodeDataSubPackets(readBuffsPB, writeBuffsPB, 
       		erasedLocationToFix, locConsiderErased, bufSizePerSubpkt, dataStart, dataLenForPB);
@@ -178,6 +212,8 @@ public class RS_PbRS_ComputeTimeComparison {
       //second type of PB-RS decoding: first do RS decoding for the second sub-packet, obtain the piggyback
       // by subtracting, and then use the encoding vector to perform elementary field operations to recover the
       // missing data in the first sub-packet.
+      readBuffsPB = returnRandomDataForDecodePB();
+      writeBuffsPB = new byte[2][paritySize][bufSizePerSubpkt];
       startTime = System.currentTimeMillis();
       pbcode.jointDecodeDataSubPacketsGenMx(readBuffsPB, writeBuffsPB, 
       		erasedLocationToFix, locConsiderErased, bufSizePerSubpkt, dataStart, dataLenForPB);
@@ -185,16 +221,45 @@ public class RS_PbRS_ComputeTimeComparison {
       
       //Reconstruct missing data bytes: by using RS decoding for the second sub-packet, obtain the piggyback
       //by subtracting, and then just do XOR to recover the missing data in the first sub-packet.
+      readBuffsPB = returnRandomDataForDecodePB();
+      writeBuffsPB = new byte[2][paritySize][bufSizePerSubpkt];
       startTime = System.currentTimeMillis();
       pbcode.jointDecodeDataSubPacketsXOR(readBuffsPB, writeBuffsPB, 
       		erasedLocationToFix, locConsiderErased, bufSizePerSubpkt, dataStart, dataLenForPB);
       long timeComputeDecodePB3 = System.currentTimeMillis() - startTime;    
       
-      timeResult = String.valueOf(timeComputeEncodeRS) + ", " + String.valueOf(timeComputeEncodePB1) + ", "
-      		+ String.valueOf(timeComputeEncodePB2); 
-      timeResult = timeResult + String.valueOf(timeComputeDecodeRS) + ", " + String.valueOf(timeComputeDecodePB1) + ", "
-      		+ String.valueOf(timeComputeDecodePB2) + ", " + String.valueOf(timeComputeDecodePB3);
+      //(non-xor and xor) PB-RS decoding of 10th data block - to measure the decoding time for with subtraction case
+      erasedLocationToFix = paritySize + 9; //last data block
+      try {
+      	locConsiderErased = pbdecoder.getLocConsiderErased(erasedLocationToFix, true);
+      } catch (TooManyErasedLocations TMEL) {
+      	LOG.info("Exception: too many erased locations.");
+      }
       
+      //non-xor (see above comment for more description)
+      readBuffsPB = returnRandomDataForDecodePB();
+      writeBuffsPB = new byte[2][paritySize][bufSizePerSubpkt];
+      startTime = System.currentTimeMillis();
+      pbcode.jointDecodeDataSubPacketsGenMx(readBuffsPB, writeBuffsPB, 
+      		erasedLocationToFix, locConsiderErased, bufSizePerSubpkt, dataStart, dataLenForPB);
+      long timeComputeDecodePB4 = System.currentTimeMillis() - startTime;
+      //xor (see above comment for more description)
+      readBuffsPB = returnRandomDataForDecodePB();
+      writeBuffsPB = new byte[2][paritySize][bufSizePerSubpkt];
+      startTime = System.currentTimeMillis();
+      pbcode.jointDecodeDataSubPacketsXOR(readBuffsPB, writeBuffsPB, 
+      		erasedLocationToFix, locConsiderErased, bufSizePerSubpkt, dataStart, dataLenForPB);
+      long timeComputeDecodePB5 = System.currentTimeMillis() - startTime;   
+      
+      
+      timeResult = String.valueOf(timeComputeEncodeRS) + ", " + String.valueOf(timeComputeEncodePB1) 
+      		+ ", " + String.valueOf(timeComputeEncodePB2)+ ", " + String.valueOf(timeComputeEncodePB3) 
+      		+ ", " + String.valueOf(timeComputeEncodePB4)+ ", " + String.valueOf(timeComputeEncodelrc); 
+      timeResult = timeResult + ", " + String.valueOf(timeComputeDecodeRS) 
+      		+ ", " + String.valueOf(timeComputeDecodePB1) + ", " + String.valueOf(timeComputeDecodePB2) 
+      		+ ", " + String.valueOf(timeComputeDecodePB3)+ ", " + String.valueOf(timeComputeDecodePB4)
+      		+ ", " + String.valueOf(timeComputeDecodePB5);
+      timeResult = timeResult + ", " + " withTenthFixed";
       //Please check if it is okay to use name1 as key in the below line
       output.collect(new Text(name1), new Text(timeResult));
       
@@ -233,10 +298,11 @@ public class RS_PbRS_ComputeTimeComparison {
       erasedLocs = new int[]{1,2,3,erasedLocationToFix}; //for RS      
       writeBuffsPB = new byte[2][paritySize][bufSizePerSubpkt];
       writeBuffsRS = new byte[paritySize][bufSize];
-      
+            
       readBufsForEncPB = new byte[2][stripeSize][bufSizePerSubpkt];
       readBufsForEncRS = new byte[stripeSize][bufSize];
       writeBufsForEncRS = new byte[paritySize][bufSize];
+      writeBuffsForEncLrc = new byte[paritySize+2][bufSize]; //two additional for local parities
       writeBufsForEncPB = new byte[2][paritySize][bufSizePerSubpkt];      		
     }
     
@@ -303,6 +369,17 @@ public class RS_PbRS_ComputeTimeComparison {
     	}    	
     	return(randomData);
     }
+    
+    private byte[][] returnRandomDataForEncodeLRC() {
+    	//
+    	byte[][] randomData = new byte[stripeSize][bufSize];
+    	//int symbolMax = (int) Math.pow(2, rscode.symbolSize());
+    	for (int i = 0; i < stripeSize; i++) {
+    		RAND.nextBytes(randomData[i]);
+    	}    	
+    	return(randomData);
+    }
+    
     @Override
     public void close() throws IOException {
       // TODO Auto-generated method stub

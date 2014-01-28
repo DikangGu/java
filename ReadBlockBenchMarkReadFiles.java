@@ -1,5 +1,10 @@
-package org.apache.hadoop.raid;
-
+package org.apache.hadoop.raid.tools;
+/*
+ * 1. Thread read times
+ * 2. Different files for different read types and blocksizes in order to avoid caching between readTypes. 
+ * Note that there is no caching problem due to parallel map reduce jobs as they are creating different files.
+ * 3. 
+ */
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
@@ -12,7 +17,10 @@ import org.apache.hadoop.conf.Configured;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hdfs.DFSUtil;
+import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.ReadOptions;
 import org.apache.hadoop.io.SequenceFile;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.SequenceFile.CompressionType;
@@ -38,6 +46,18 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
   
   int numFiles = ReadBlockBenchMarkCreateFiles.numFiles;
   static long[] blockSizes = ReadBlockBenchMarkCreateFiles.blockSizes;
+  static String[] readTypes = ReadBlockBenchMarkCreateFiles.readTypes;
+  // To be initiated for every run in readFromFile() and to be filled by each ReadWorker thread 
+  static long[] threadDurations = null;
+
+	  {
+	       Configuration.addDefaultResource("hdfs-default.xml");
+	       Configuration.addDefaultResource("hdfs-site.xml");
+	       Configuration.addDefaultResource("core-site.xml");
+	
+	       Configuration.addDefaultResource("raid-default.xml");
+	       Configuration.addDefaultResource("raid-site.xml");
+	  }
 
   private void backupOutputDir(FileSystem fs) throws IOException {
     if (fs.exists(OUTPUT_DIR)) {
@@ -48,7 +68,9 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
   
   @Override
   public int run(String[] args) throws Exception {
-    Configuration conf = new Configuration(getConf());
+    Configuration conf = new Configuration();
+   conf.set("mapred.fairscheduler.pool", "di.sla");
+   conf.setBoolean("mapreduce.job.user.classpath.first", true);
     FileSystem fs = FileSystem.get(conf);
     
     //createControlFile(fs, numFiles, conf);
@@ -92,6 +114,10 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
   private static String getFileNameWithBlockSize(String base, long blockSize) {
     return base + '_' + Long.toString(blockSize);
   }
+  
+  private static String getFileNameWithBlockSizeAndReadType(String base, long blockSize, String readType) {
+    return base + '_' + blockSize + '_' + readType;
+  }
 
   
   private static void runBenchmark(Path outputDir, Configuration conf) 
@@ -110,12 +136,13 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
   }
   
   
-  private static void readFromFile(FileSystem fs, Path filePath,
+  private static long[] readFromFile(FileSystem fs, Path filePath,
       long[] startPos, long[] readLens, Reporter reporter) throws InterruptedException {
     int size = startPos.length;
     Thread[] threads = new Thread[size];
+    threadDurations = new long[size];
     for (int i = 0; i < size; i++) {
-      threads[i] = new ReadWorker(fs, filePath, startPos[i], readLens[i], reporter);
+      threads[i] = new ReadWorker(i, fs, filePath, startPos[i], readLens[i], reporter);
     }
     
     for (int i = 0; i < size; i++) {
@@ -125,10 +152,13 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
     for (int i = 0; i < size; i++) {
       threads[i].join();
     }
+    
+    return(threadDurations);
   }
   
    
   public static class ReadWorker extends Thread {
+    int threadID;
     FileSystem fs;
     Path filePath;
     long startPos;
@@ -138,8 +168,9 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
     int bufferSize = 4096;
     byte[] buffer = new byte[bufferSize];
 
-    public ReadWorker(FileSystem fs, Path filePath, long startPos,
+    public ReadWorker(int threadID, FileSystem fs, Path filePath, long startPos,
         long readLen, Reporter reporter) {
+      this.threadID = threadID;
       this.fs = fs;
       this.filePath = filePath;
       this.startPos = startPos;
@@ -149,8 +180,12 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
     
     @Override
     public void run() {
+      long startTime = System.currentTimeMillis();
       try {
-        FSDataInputStream in = fs.open(filePath);
+        DistributedFileSystem dfs = DFSUtil.convertToDFS(fs);
+        ReadOptions options = new ReadOptions();
+        options.setFadvise(4);
+        FSDataInputStream in = dfs.open(filePath, options);
         in.seek(startPos);
         
         long left = readLen;
@@ -167,6 +202,7 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
       } catch (IOException e) {
         throw new RuntimeException("error when reading from file: " + filePath, e);
       } finally {
+        threadDurations[threadID] = System.currentTimeMillis() - startTime;
         reporter.progress();
       }
     }
@@ -211,8 +247,7 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
       String name1 = key.toString();
       
       for (int j = 0; j< blockSizes.length;j++) {
-        String name = getFileNameWithBlockSize(name1, blockSizes[j]);
-        Path filePath = new Path(DATA_DIR, name);
+                
       	long blockSize = blockSizes[j];
       	//since creating is already done using another mapper
       	/* createFile(fs, new Path(name), blockSize, bufferSize, 
@@ -222,9 +257,11 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
       	String timeResult = "";
       	
       	// read full blockSize from 10 blocks;
+      	String name = getFileNameWithBlockSizeAndReadType(name1, blockSizes[j],readTypes[0]);
+      	Path filePath = new Path(DATA_DIR, name);
       	long[] startPos = new long[10];
       	long[] readLens = new long[10];
-
+      	long[] threadReadTimes = new long[10];
       	for (int i = 0; i < 10; i++) {
       		startPos[i] = i * blockSize;
       		readLens[i] = blockSize;
@@ -232,15 +269,18 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
 
       	long startTime = System.currentTimeMillis();
       	try {
-      		readFromFile(fs, filePath, startPos, readLens, reporter);
+      		threadReadTimes = readFromFile(fs, filePath, startPos, readLens, reporter);
       	} catch (InterruptedException e) {
       		throw new InterruptedIOException();
       	}
       	long totalTime = System.currentTimeMillis() - startTime;
       	
       	//read 2 full blocks and 9 half blocks
+      	name = getFileNameWithBlockSizeAndReadType(name1, blockSizes[j],readTypes[1]);
+      	filePath = new Path(DATA_DIR, name);
       	long[] startPos2 = new long[11];
       	long[] readLens2 = new long[11];
+      	long[] threadReadTimes2 = new long[11];
       	
       	for (int i = 0; i < 11; i++) {
       		startPos2[i] = i * blockSize;
@@ -252,31 +292,36 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
       	}
       	startTime = System.currentTimeMillis();
       	try {
-      		readFromFile(fs, filePath, startPos2, readLens2, reporter);
+      		threadReadTimes2 = readFromFile(fs, filePath, startPos2, readLens2, reporter);
       	} catch (InterruptedException e) {
       		throw new InterruptedIOException();
       	}
       	long totalTime2 = System.currentTimeMillis() - startTime;
       	
       	//read 13 half blocks (total = 6.5*blockSize)
+      	name = getFileNameWithBlockSizeAndReadType(name1, blockSizes[j],readTypes[2]);
+      	filePath = new Path(DATA_DIR, name);
       	long[] startPos3 = new long[13];
       	long[] readLens3 = new long[13];
-      	
+      	long[] threadReadTimes3 = new long[13];
       	for (int i = 0; i < 13; i++) {
       		startPos3[i] = i * blockSize;
       		readLens3[i] = (long) Math.round((double) blockSize/2.0);      		      		
       	}
       	startTime = System.currentTimeMillis();
       	try {
-      		readFromFile(fs, filePath, startPos3, readLens3, reporter);
+      		threadReadTimes3 = readFromFile(fs, filePath, startPos3, readLens3, reporter);
       	} catch (InterruptedException e) {
       		throw new InterruptedIOException();
       	}
       	long totalTime3 = System.currentTimeMillis() - startTime;
       	
+      	/*
       	//read (10/m)*blockSize from m nodes for m= 11,12,13
       	long[] totalTimes4 = new long[3];
       	for (int k = 1; k < 4; k++) {
+      		name = getFileNameWithBlockSizeAndReadType(name1, blockSizes[j],readTypes[2+k]);
+        	filePath = new Path(DATA_DIR, name);
       		//(int m, long blockSize, FileSystem fs, String name)
         	totalTimes4[k - 1] = readAndReturnReadTime(k, blockSize, fs, filePath, reporter);
       	}
@@ -284,6 +329,20 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
       	timeResult = String.valueOf(totalTime) + ", " + String.valueOf(totalTime2) + ", "
       	    + String.valueOf(totalTime3) + ", " + String.valueOf(totalTimes4[0]) + ", " 
       	    + String.valueOf(totalTimes4[1]) + ", " + String.valueOf(totalTimes4[2]);
+      	*/
+      	timeResult = String.valueOf(totalTime) + ", " + String.valueOf(totalTime2) + ", "
+      	    + String.valueOf(totalTime3);
+      	for (int i = 0; i< 10; i++) {
+      		timeResult = timeResult + ", " + String.valueOf(threadReadTimes[i]);
+      	}
+      	
+      	for (int i = 0; i< 11; i++) {
+      		timeResult = timeResult + ", " + String.valueOf(threadReadTimes2[i]);
+      	}
+      	for (int i = 0; i< 13; i++) {
+      		timeResult = timeResult + ", " + String.valueOf(threadReadTimes3[i]);
+      	}
+      	    
       	output.collect(new Text(name), new Text(timeResult));
       }
     }
@@ -295,7 +354,7 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
       } catch (IOException e) {
         throw new RuntimeException("Can not create file system.", e);
       }
-      bufferSize = conf.getInt("test.io.file.buffer.size", 4096);
+      bufferSize = conf.getInt("dfs.io.file.buffer.size", 4096);
     }
 
     @Override
@@ -307,7 +366,8 @@ public class ReadBlockBenchMarkReadFiles extends Configured implements Tool {
   }
   
   public static void main(String[] args) throws Exception {
-    int res = ToolRunner.run(new ReadBlockBenchMarkReadFiles(), args);
+    int res = new ReadBlockBenchMarkReadFiles().run(args);
+    //int res = ToolRunner.run(new ReadBlockBenchMarkReadFiles(), args);
     System.exit(res);
   }
 }
